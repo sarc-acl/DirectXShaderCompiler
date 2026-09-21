@@ -8,7 +8,7 @@ on:
     inputs:
       release_tag:
         description: 'Release tag'
-        default: 'v1.8.2505.1'
+        default: 'v1.9.2607'
         required: true
         type: string
 
