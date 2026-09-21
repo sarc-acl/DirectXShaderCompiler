@@ -10,9 +10,9 @@
 #include "ShaderOpTest.h"
 #include "dxc/Support/Global.h"
 
-#include "HlslTestUtils.h"
-
 #include "HlslExecTestUtils.h"
+#include "HlslTestDataTypes.h"
+#include "HlslTestUtils.h"
 
 #include <algorithm>
 #include <array>
@@ -59,14 +59,26 @@ DATA_TYPE(uint16_t, "uint16_t", 2)
 DATA_TYPE(uint32_t, "uint32_t", 4)
 DATA_TYPE(uint64_t, "uint64_t", 8)
 DATA_TYPE(HLSLHalf_t, "half", 2)
+DATA_TYPE(HLSLMin16Float_t, "min16float", 4)
+DATA_TYPE(HLSLMin16Int_t, "min16int", 4)
+DATA_TYPE(HLSLMin16Uint_t, "min16uint", 4)
 DATA_TYPE(float, "float", 4)
 DATA_TYPE(double, "double", 8)
 
 #undef DATA_TYPE
 
+using HLSLTestDataTypes::doValuesMatch;
+using HLSLTestDataTypes::ValidationType;
+
 template <typename T> constexpr bool isFloatingPointType() {
   return std::is_same_v<T, float> || std::is_same_v<T, double> ||
-         std::is_same_v<T, HLSLHalf_t>;
+         std::is_same_v<T, HLSLHalf_t> || std::is_same_v<T, HLSLMin16Float_t>;
+}
+
+template <typename T> constexpr bool isMinPrecisionType() {
+  return std::is_same_v<T, HLSLMin16Float_t> ||
+         std::is_same_v<T, HLSLMin16Int_t> ||
+         std::is_same_v<T, HLSLMin16Uint_t>;
 }
 
 //
@@ -184,72 +196,6 @@ void logLongVector(const std::vector<T> &Values, const std::wstring &Name) {
   Wss << L" ]";
 
   hlsl_test::LogCommentFmt(Wss.str().c_str());
-}
-
-enum class ValidationType {
-  Epsilon,
-  Ulp,
-};
-
-template <typename T>
-bool doValuesMatch(T A, T B, double Tolerance, ValidationType) {
-  if (Tolerance == 0.0)
-    return A == B;
-
-  T Diff = A > B ? A - B : B - A;
-  return Diff <= Tolerance;
-}
-
-bool doValuesMatch(HLSLBool_t A, HLSLBool_t B, double, ValidationType) {
-  return A == B;
-}
-
-bool doValuesMatch(HLSLHalf_t A, HLSLHalf_t B, double Tolerance,
-                   ValidationType ValidationType) {
-  switch (ValidationType) {
-  case ValidationType::Epsilon:
-    return CompareHalfEpsilon(A.Val, B.Val, static_cast<float>(Tolerance));
-  case ValidationType::Ulp:
-    return CompareHalfULP(A.Val, B.Val, static_cast<float>(Tolerance));
-  default:
-    hlsl_test::LogErrorFmt(
-        L"Invalid ValidationType. Expecting Epsilon or ULP.");
-    return false;
-  }
-}
-
-bool doValuesMatch(float A, float B, double Tolerance,
-                   ValidationType ValidationType) {
-  switch (ValidationType) {
-  case ValidationType::Epsilon:
-    return CompareFloatEpsilon(A, B, static_cast<float>(Tolerance));
-  case ValidationType::Ulp: {
-    // Tolerance is in ULPs. Convert to int for the comparison.
-    const int IntTolerance = static_cast<int>(Tolerance);
-    return CompareFloatULP(A, B, IntTolerance);
-  };
-  default:
-    hlsl_test::LogErrorFmt(
-        L"Invalid ValidationType. Expecting Epsilon or ULP.");
-    return false;
-  }
-}
-
-bool doValuesMatch(double A, double B, double Tolerance,
-                   ValidationType ValidationType) {
-  switch (ValidationType) {
-  case ValidationType::Epsilon:
-    return CompareDoubleEpsilon(A, B, Tolerance);
-  case ValidationType::Ulp: {
-    // Tolerance is in ULPs. Convert to int64_t for the comparison.
-    const int64_t IntTolerance = static_cast<int64_t>(Tolerance);
-    return CompareDoubleULP(A, B, IntTolerance);
-  };
-  default:
-    hlsl_test::LogErrorFmt(
-        L"Invalid ValidationType. Expecting Epsilon or ULP.");
-    return false;
-  }
 }
 
 template <typename T>
@@ -755,8 +701,17 @@ template <typename T> uint32_t FirstBitLow(T A) {
 DEFAULT_OP_2(OpType::And, (A & B));
 DEFAULT_OP_2(OpType::Or, (A | B));
 DEFAULT_OP_2(OpType::Xor, (A ^ B));
-DEFAULT_OP_2(OpType::LeftShift, (A << B));
-DEFAULT_OP_2(OpType::RightShift, (A >> B));
+
+// HLSL/DXIL masks shift amounts to the low bits (4 bits for 16-bit, 5 bits for
+// 32-bit, 6 bits for 64-bit). We must do the same in C++ to avoid undefined
+// behavior when shift amount >= bit width, and to match GPU results.
+template <typename T> T MaskShiftAmount(T ShiftAmount) {
+  constexpr T ShiftMask = static_cast<T>(sizeof(T) * 8 - 1);
+  return ShiftAmount & ShiftMask;
+}
+
+DEFAULT_OP_2(OpType::LeftShift, (A << MaskShiftAmount(B)));
+DEFAULT_OP_2(OpType::RightShift, (A >> MaskShiftAmount(B)));
 DEFAULT_OP_1(OpType::Saturate, (Saturate(A)));
 DEFAULT_OP_1(OpType::ReverseBits, (ReverseBits(A)));
 
@@ -905,6 +860,24 @@ template <> struct TrigonometricValidation<HLSLHalf_t, OpType::Tan> {
 };
 
 template <> struct TrigonometricValidation<HLSLHalf_t, OpType::Sinh> {
+  ValidationConfig ValidationConfig = ValidationConfig::Ulp(2.0f);
+};
+
+// Min precision trig tolerances: same as half precision since min precision
+// is at least 16-bit and our doValuesMatch compares in half-precision space.
+template <OpType OP> struct TrigonometricValidation<HLSLMin16Float_t, OP> {
+  ValidationConfig ValidationConfig = ValidationConfig::Epsilon(0.003f);
+};
+
+template <> struct TrigonometricValidation<HLSLMin16Float_t, OpType::Cosh> {
+  ValidationConfig ValidationConfig = ValidationConfig::Ulp(2.0f);
+};
+
+template <> struct TrigonometricValidation<HLSLMin16Float_t, OpType::Tan> {
+  ValidationConfig ValidationConfig = ValidationConfig::Ulp(2.0f);
+};
+
+template <> struct TrigonometricValidation<HLSLMin16Float_t, OpType::Sinh> {
   ValidationConfig ValidationConfig = ValidationConfig::Ulp(2.0f);
 };
 
@@ -1064,7 +1037,7 @@ template <> struct ExpectedBuilder<OpType::AsUint_SplitDouble, double> {
 //
 
 template <typename T> T UnaryMathAbs(T A) {
-  if constexpr (std::is_unsigned_v<T>)
+  if constexpr (std::is_unsigned_v<T> || std::is_same_v<T, HLSLMin16Uint_t>)
     return A;
   else
     return static_cast<T>(std::abs(A));
@@ -1276,7 +1249,12 @@ static double computeAbsoluteEpsilon(double A, double ULPTolerance) {
 
   if constexpr (std::is_same_v<T, HLSLHalf_t>)
     ULP = HLSLHalf_t::GetULP(A);
-  else
+  else if constexpr (std::is_same_v<T, HLSLMin16Float_t>) {
+    // Min precision floats may be computed at float16 on the GPU, so use
+    // half-precision ULP for tolerance. Reuse HLSLHalf_t::GetULP which
+    // computes ULP by incrementing the float16 bit representation.
+    ULP = HLSLHalf_t::GetULP(HLSLHalf_t(static_cast<float>(A)));
+  } else
     ULP =
         std::nextafter(static_cast<T>(A), std::numeric_limits<T>::infinity()) -
         static_cast<T>(A);
@@ -1371,14 +1349,14 @@ template <typename T> struct ExpectedBuilder<OpType::ModF, T> {
 // The value of A in each lane is computed by : A = A + LaneID*2
 //
 // Top right (lane 1) - Top Left (lane 0)
-DEFAULT_OP_1(OpType::DerivativeDdx, ((A + 2) - (A + 0)));
+DEFAULT_OP_1(OpType::DerivativeDdx, ((A + T(2.0f)) - (A + T(0.0f))));
 // Lower left (lane 2) -  Top Left (lane 0)
-DEFAULT_OP_1(OpType::DerivativeDdy, ((A + 4) - (A + 0)));
+DEFAULT_OP_1(OpType::DerivativeDdy, ((A + T(4.0f)) - (A + T(0.0f))));
 
 // Bottom right (lane 3) - Bottom left (lane 2)
-DEFAULT_OP_1(OpType::DerivativeDdxFine, ((A + 6) - (A + 4)));
+DEFAULT_OP_1(OpType::DerivativeDdxFine, ((A + T(6.0f)) - (A + T(4.0f))));
 // Bottom right (lane 3) - Top right (lane 1)
-DEFAULT_OP_1(OpType::DerivativeDdyFine, ((A + 6) - (A + 2)));
+DEFAULT_OP_1(OpType::DerivativeDdyFine, ((A + T(6.0f)) - (A + T(2.0f))));
 
 //
 // Quad Read Ops
@@ -1726,8 +1704,25 @@ template <OpType OP, typename T> struct ExpectedBuilder {
   }
 };
 
+#if defined(_M_IX86) && !defined(_HLK_CONF)
+constexpr bool isX86WarpMemoryLimitedOp(OpType Op) {
+  switch (Op) {
+  case OpType::QuadReadLaneAt:
+  case OpType::QuadReadAcrossX:
+  case OpType::QuadReadAcrossY:
+  case OpType::QuadReadAcrossDiagonal:
+  case OpType::AsDouble:
+  case OpType::AsUint_SplitDouble:
+    return true;
+  default:
+    return false;
+  }
+}
+#endif
+
 template <typename T, OpType OP>
-std::vector<size_t> getInputSizesToTest(size_t OverrideInputSize) {
+std::vector<size_t> getInputSizesToTest(size_t OverrideInputSize,
+                                        ID3D12Device *D3DDevice) {
   std::vector<size_t> InputVectorSizes;
   const std::array<size_t, 8> DefaultInputSizes = {3,  5,   16,  17,
                                                    35, 100, 256, 1024};
@@ -1736,8 +1731,18 @@ std::vector<size_t> getInputSizesToTest(size_t OverrideInputSize) {
     InputVectorSizes.push_back(OverrideInputSize);
   else {
     // StructuredBuffers have a max size of 2048 bytes.
-    const size_t MaxInputSize =
+    size_t MaxInputSize =
         IsStructuredBufferLoadAndStoreOp(OP) ? 2048 / sizeof(T) : 1024;
+
+#if defined(_M_IX86) && !defined(_HLK_CONF)
+    // X86 Execution tests running against WARP cannot run the
+    // largest vector sizes within the available address space for
+    // some Ops. Cap the max size to work around that.
+    if (isX86WarpMemoryLimitedOp(OP) && isWarp(D3DDevice))
+      MaxInputSize = std::min(MaxInputSize, size_t{256});
+#else
+    (void)D3DDevice;
+#endif
 
     for (size_t Size : DefaultInputSizes) {
       if (Size <= MaxInputSize)
@@ -1756,7 +1761,7 @@ void dispatchTest(ID3D12Device *D3DDevice, bool VerboseLogging,
                   size_t OverrideInputSize) {
 
   const std::vector<size_t> InputVectorSizes =
-      getInputSizesToTest<T, OP>(OverrideInputSize);
+      getInputSizesToTest<T, OP>(OverrideInputSize, D3DDevice);
 
   constexpr const Operation &Operation = getOperation(OP);
   Op<OP, T, Operation.Arity> Op;
@@ -1777,7 +1782,7 @@ void dispatchWaveOpTest(ID3D12Device *D3DDevice, bool VerboseLogging,
                         size_t OverrideInputSize, UINT WaveSize) {
 
   const std::vector<size_t> InputVectorSizes =
-      getInputSizesToTest<T, OP>(OverrideInputSize);
+      getInputSizesToTest<T, OP>(OverrideInputSize, D3DDevice);
 
   constexpr const Operation &Operation = getOperation(OP);
   Op<OP, T, Operation.Arity> Op;
@@ -1805,16 +1810,6 @@ using namespace LongVector;
 #define HLK_TEST(Op, DataType)                                                 \
   TEST_METHOD(Op##_##DataType) { runTest<DataType, OpType::Op>(); }
 
-#define HLK_TEST_DOUBLE(Op, DataType)                                          \
-  TEST_METHOD(Op##_##DataType) {                                               \
-    BEGIN_TEST_METHOD_PROPERTIES()                                             \
-    TEST_METHOD_PROPERTY(                                                      \
-        "Kits.Specification",                                                  \
-        "Device.Graphics.D3D12.DXILCore.ShaderModel69.DoublePrecision")        \
-    END_TEST_METHOD_PROPERTIES()                                               \
-    runTest<DataType, OpType::Op>();                                           \
-  }
-
 #define HLK_WAVEOP_TEST(Op, DataType)                                          \
   TEST_METHOD(Op##_##DataType) {                                               \
     BEGIN_TEST_METHOD_PROPERTIES()                                             \
@@ -1825,31 +1820,9 @@ using namespace LongVector;
     runWaveOpTest<DataType, OpType::Op>();                                     \
   }
 
-#define HLK_WAVEOP_TEST_DOUBLE(Op, DataType)                                   \
-  TEST_METHOD(Op##_##DataType) {                                               \
-    BEGIN_TEST_METHOD_PROPERTIES()                                             \
-    TEST_METHOD_PROPERTY(                                                      \
-        "Kits.Specification",                                                  \
-        "Device.Graphics.D3D12.DXILCore.ShaderModel69.DoublePrecision")        \
-    END_TEST_METHOD_PROPERTIES()                                               \
-    runWaveOpTest<DataType, OpType::Op>();                                     \
-  }
-
-class DxilConf_SM69_Vectorized {
+class TestClassCommon {
 public:
-  BEGIN_TEST_CLASS(DxilConf_SM69_Vectorized)
-  TEST_CLASS_PROPERTY("Kits.TestName",
-                      "D3D12 - Shader Model 6.9 - Vectorized DXIL - Core Tests")
-  TEST_CLASS_PROPERTY("Kits.TestId", "81db1ff8-5bc5-48a1-8d7b-600fc600a677")
-  TEST_CLASS_PROPERTY("Kits.Description",
-                      "Validates required SM 6.9 vectorized DXIL operations")
-  TEST_CLASS_PROPERTY(
-      "Kits.Specification",
-      "Device.Graphics.D3D12.DXILCore.ShaderModel69.CoreRequirement")
-  TEST_METHOD_PROPERTY(L"Priority", L"0")
-  END_TEST_CLASS()
-
-  TEST_CLASS_SETUP(classSetup) {
+  bool setupClass() {
     WEX::TestExecution::SetVerifyOutput verifySettings(
         WEX::TestExecution::VerifyOutputSettings::LogOnlyFailures);
 
@@ -1911,7 +1884,7 @@ public:
     return true;
   }
 
-  TEST_METHOD_SETUP(methodSetup) {
+  bool setupMethod() {
     // It's possible a previous test case caused a device removal. If it did we
     // need to try and create a new device.
     if (D3DDevice && D3DDevice->GetDeviceRemovedReason() != S_OK) {
@@ -1962,11 +1935,39 @@ public:
   template <typename T, OpType OP> void runTest() {
     WEX::TestExecution::SetVerifyOutput verifySettings(
         WEX::TestExecution::VerifyOutputSettings::LogOnlyFailures);
+
     dispatchTest<T, OP>(D3DDevice, VerboseLogging, OverrideInputSize);
   }
 
-  // TernaryMath
+protected:
+  CComPtr<ID3D12Device> D3DDevice;
 
+private:
+  bool Initialized = false;
+  std::optional<D3D12SDKSelector> D3D12SDK;
+  bool VerboseLogging = false;
+  size_t OverrideInputSize = 0;
+  UINT OverrideWaveLaneCount = 0;
+};
+
+class DxilConf_SM69_Vectorized_Core : public TestClassCommon {
+public:
+  BEGIN_TEST_CLASS(DxilConf_SM69_Vectorized_Core)
+  TEST_CLASS_PROPERTY("Kits.TestName",
+                      "D3D12 - Shader Model 6.9 - Vectorized DXIL - Core Tests")
+  TEST_CLASS_PROPERTY("Kits.TestId", "81db1ff8-5bc5-48a1-8d7b-600fc600a677")
+  TEST_CLASS_PROPERTY("Kits.Description",
+                      "Validates required SM 6.9 vectorized DXIL operations")
+  TEST_CLASS_PROPERTY(
+      "Kits.Specification",
+      "Device.Graphics.D3D12.DXILCore.ShaderModel69.CoreRequirement")
+  TEST_METHOD_PROPERTY(L"Priority", L"0")
+  END_TEST_CLASS()
+
+  TEST_CLASS_SETUP(setupClass) { return TestClassCommon::setupClass(); }
+  TEST_METHOD_SETUP(setupMethod) { return TestClassCommon::setupMethod(); }
+
+  // TernaryMath
   HLK_TEST(Mad, uint16_t);
   HLK_TEST(Mad, uint32_t);
   HLK_TEST(Mad, uint64_t);
@@ -1975,11 +1976,8 @@ public:
   HLK_TEST(Mad, int64_t);
   HLK_TEST(Mad, HLSLHalf_t);
   HLK_TEST(Mad, float);
-  HLK_TEST_DOUBLE(Fma, double);
-  HLK_TEST_DOUBLE(Mad, double);
 
   // BinaryMath
-
   HLK_TEST(Add, HLSLBool_t);
   HLK_TEST(Subtract, HLSLBool_t);
   HLK_TEST(Add, int16_t);
@@ -2040,15 +2038,8 @@ public:
   HLK_TEST(Min, float);
   HLK_TEST(Max, float);
   HLK_TEST(Ldexp, float);
-  HLK_TEST_DOUBLE(Add, double);
-  HLK_TEST_DOUBLE(Subtract, double);
-  HLK_TEST_DOUBLE(Multiply, double);
-  HLK_TEST_DOUBLE(Divide, double);
-  HLK_TEST_DOUBLE(Min, double);
-  HLK_TEST_DOUBLE(Max, double);
 
   // Bitwise
-
   HLK_TEST(And, uint16_t);
   HLK_TEST(Or, uint16_t);
   HLK_TEST(Xor, uint16_t);
@@ -2105,10 +2096,8 @@ public:
   HLK_TEST(FirstBitLow, int64_t);
   HLK_TEST(Saturate, HLSLHalf_t);
   HLK_TEST(Saturate, float);
-  HLK_TEST_DOUBLE(Saturate, double);
 
   // Unary
-
   HLK_TEST(Initialize, HLSLBool_t);
   HLK_TEST(ArrayOperator_StaticAccess, HLSLBool_t);
   HLK_TEST(ArrayOperator_DynamicAccess, HLSLBool_t);
@@ -2136,9 +2125,6 @@ public:
   HLK_TEST(Initialize, float);
   HLK_TEST(ArrayOperator_StaticAccess, float);
   HLK_TEST(ArrayOperator_DynamicAccess, float);
-  HLK_TEST_DOUBLE(Initialize, double);
-  HLK_TEST_DOUBLE(ArrayOperator_StaticAccess, double);
-  HLK_TEST_DOUBLE(ArrayOperator_DynamicAccess, double);
 
   HLK_TEST(ShuffleVector, HLSLBool_t);
   HLK_TEST(ShuffleVector, int16_t);
@@ -2149,10 +2135,8 @@ public:
   HLK_TEST(ShuffleVector, uint64_t);
   HLK_TEST(ShuffleVector, HLSLHalf_t);
   HLK_TEST(ShuffleVector, float);
-  HLK_TEST_DOUBLE(ShuffleVector, double);
 
   // Explicit Cast
-
   HLK_TEST(CastToInt16, HLSLBool_t);
   HLK_TEST(CastToInt32, HLSLBool_t);
   HLK_TEST(CastToInt64, HLSLBool_t);
@@ -2161,7 +2145,6 @@ public:
   HLK_TEST(CastToUint64, HLSLBool_t);
   HLK_TEST(CastToFloat16, HLSLBool_t);
   HLK_TEST(CastToFloat32, HLSLBool_t);
-  HLK_TEST(CastToFloat64, HLSLBool_t);
 
   HLK_TEST(CastToBool, HLSLHalf_t);
   HLK_TEST(CastToInt16, HLSLHalf_t);
@@ -2171,7 +2154,6 @@ public:
   HLK_TEST(CastToUint32_FromFP, HLSLHalf_t);
   HLK_TEST(CastToUint64_FromFP, HLSLHalf_t);
   HLK_TEST(CastToFloat32, HLSLHalf_t);
-  HLK_TEST(CastToFloat64, HLSLHalf_t);
 
   HLK_TEST(CastToBool, float);
   HLK_TEST(CastToInt16, float);
@@ -2181,17 +2163,6 @@ public:
   HLK_TEST(CastToUint32_FromFP, float);
   HLK_TEST(CastToUint64_FromFP, float);
   HLK_TEST(CastToFloat16, float);
-  HLK_TEST(CastToFloat64, float);
-
-  HLK_TEST_DOUBLE(CastToBool, double);
-  HLK_TEST_DOUBLE(CastToInt16, double);
-  HLK_TEST_DOUBLE(CastToInt32, double);
-  HLK_TEST_DOUBLE(CastToInt64, double);
-  HLK_TEST_DOUBLE(CastToUint16_FromFP, double);
-  HLK_TEST_DOUBLE(CastToUint32_FromFP, double);
-  HLK_TEST_DOUBLE(CastToUint64_FromFP, double);
-  HLK_TEST_DOUBLE(CastToFloat16, double);
-  HLK_TEST_DOUBLE(CastToFloat32, double);
 
   HLK_TEST(CastToBool, uint16_t);
   HLK_TEST(CastToInt16, uint16_t);
@@ -2201,7 +2172,6 @@ public:
   HLK_TEST(CastToUint64, uint16_t);
   HLK_TEST(CastToFloat16, uint16_t);
   HLK_TEST(CastToFloat32, uint16_t);
-  HLK_TEST(CastToFloat64, uint16_t);
 
   HLK_TEST(CastToBool, uint32_t);
   HLK_TEST(CastToInt16, uint32_t);
@@ -2211,7 +2181,6 @@ public:
   HLK_TEST(CastToUint64, uint32_t);
   HLK_TEST(CastToFloat16, uint32_t);
   HLK_TEST(CastToFloat32, uint32_t);
-  HLK_TEST(CastToFloat64, uint32_t);
 
   HLK_TEST(CastToBool, uint64_t);
   HLK_TEST(CastToInt16, uint64_t);
@@ -2221,7 +2190,6 @@ public:
   HLK_TEST(CastToUint32, uint64_t);
   HLK_TEST(CastToFloat16, uint64_t);
   HLK_TEST(CastToFloat32, uint64_t);
-  HLK_TEST(CastToFloat64, uint64_t);
 
   HLK_TEST(CastToBool, int16_t);
   HLK_TEST(CastToInt32, int16_t);
@@ -2231,7 +2199,6 @@ public:
   HLK_TEST(CastToUint64, int16_t);
   HLK_TEST(CastToFloat16, int16_t);
   HLK_TEST(CastToFloat32, int16_t);
-  HLK_TEST(CastToFloat64, int16_t);
 
   HLK_TEST(CastToBool, int32_t);
   HLK_TEST(CastToInt16, int32_t);
@@ -2241,7 +2208,6 @@ public:
   HLK_TEST(CastToUint64, int32_t);
   HLK_TEST(CastToFloat16, int32_t);
   HLK_TEST(CastToFloat32, int32_t);
-  HLK_TEST(CastToFloat64, int32_t);
 
   HLK_TEST(CastToBool, int64_t);
   HLK_TEST(CastToInt16, int64_t);
@@ -2251,10 +2217,8 @@ public:
   HLK_TEST(CastToUint64, int64_t);
   HLK_TEST(CastToFloat16, int64_t);
   HLK_TEST(CastToFloat32, int64_t);
-  HLK_TEST(CastToFloat64, int64_t);
 
   // Trigonometric
-
   HLK_TEST(Acos, HLSLHalf_t);
   HLK_TEST(Asin, HLSLHalf_t);
   HLK_TEST(Atan, HLSLHalf_t);
@@ -2275,7 +2239,6 @@ public:
   HLK_TEST(Tanh, float);
 
   // AsType
-
   HLK_TEST(AsFloat16, int16_t);
   HLK_TEST(AsInt16, int16_t);
   HLK_TEST(AsUint16, int16_t);
@@ -2288,14 +2251,11 @@ public:
   HLK_TEST(AsFloat, uint32_t);
   HLK_TEST(AsInt, uint32_t);
   HLK_TEST(AsUint, uint32_t);
-  HLK_TEST(AsDouble, uint32_t);
   HLK_TEST(AsFloat16, HLSLHalf_t);
   HLK_TEST(AsInt16, HLSLHalf_t);
   HLK_TEST(AsUint16, HLSLHalf_t);
-  HLK_TEST(AsUint_SplitDouble, double);
 
   // Unary Math
-
   HLK_TEST(Abs, int16_t);
   HLK_TEST(Sign, int16_t);
   HLK_TEST(Abs, int32_t);
@@ -2339,11 +2299,8 @@ public:
   HLK_TEST(Log10, float);
   HLK_TEST(Log2, float);
   HLK_TEST(Frexp, float);
-  HLK_TEST_DOUBLE(Abs, double);
-  HLK_TEST_DOUBLE(Sign, double);
 
   // Float Special
-
   HLK_TEST(IsFinite, HLSLHalf_t);
   HLK_TEST(IsInf, HLSLHalf_t);
   HLK_TEST(IsNan, HLSLHalf_t);
@@ -2355,7 +2312,6 @@ public:
   HLK_TEST(ModF, float);
 
   // Binary Comparison
-
   HLK_TEST(LessThan, int16_t);
   HLK_TEST(LessEqual, int16_t);
   HLK_TEST(GreaterThan, int16_t);
@@ -2404,15 +2360,8 @@ public:
   HLK_TEST(GreaterEqual, float);
   HLK_TEST(Equal, float);
   HLK_TEST(NotEqual, float);
-  HLK_TEST_DOUBLE(LessThan, double);
-  HLK_TEST_DOUBLE(LessEqual, double);
-  HLK_TEST_DOUBLE(GreaterThan, double);
-  HLK_TEST_DOUBLE(GreaterEqual, double);
-  HLK_TEST_DOUBLE(Equal, double);
-  HLK_TEST_DOUBLE(NotEqual, double);
 
   // Binary Logical
-
   HLK_TEST(Logical_And, HLSLBool_t);
   HLK_TEST(Logical_Or, HLSLBool_t);
 
@@ -2426,7 +2375,6 @@ public:
   HLK_TEST(Select, uint64_t);
   HLK_TEST(Select, HLSLHalf_t);
   HLK_TEST(Select, float);
-  HLK_TEST_DOUBLE(Select, double);
 
   // Reduction
   HLK_TEST(Any_Mixed, HLSLBool_t);
@@ -2467,7 +2415,6 @@ public:
   // RD == Root Descriptor
   // DT == Descriptor Table
   // SB == Structured Buffer
-
   HLK_TEST(LoadAndStore_RDH_BAB_SRV, HLSLHalf_t);
   HLK_TEST(LoadAndStore_RDH_BAB_UAV, HLSLHalf_t);
   HLK_TEST(LoadAndStore_DT_BAB_SRV, HLSLHalf_t);
@@ -2585,19 +2532,6 @@ public:
   HLK_TEST(LoadAndStore_RD_SB_UAV, float);
   HLK_TEST(LoadAndStore_RD_SB_SRV, float);
 
-  HLK_TEST_DOUBLE(LoadAndStore_RDH_BAB_SRV, double);
-  HLK_TEST_DOUBLE(LoadAndStore_RDH_BAB_UAV, double);
-  HLK_TEST_DOUBLE(LoadAndStore_DT_BAB_SRV, double);
-  HLK_TEST_DOUBLE(LoadAndStore_DT_BAB_UAV, double);
-  HLK_TEST_DOUBLE(LoadAndStore_RD_BAB_SRV, double);
-  HLK_TEST_DOUBLE(LoadAndStore_RD_BAB_UAV, double);
-  HLK_TEST_DOUBLE(LoadAndStore_RDH_SB_SRV, double);
-  HLK_TEST_DOUBLE(LoadAndStore_RDH_SB_UAV, double);
-  HLK_TEST_DOUBLE(LoadAndStore_DT_SB_SRV, double);
-  HLK_TEST_DOUBLE(LoadAndStore_DT_SB_UAV, double);
-  HLK_TEST_DOUBLE(LoadAndStore_RD_SB_SRV, double);
-  HLK_TEST_DOUBLE(LoadAndStore_RD_SB_UAV, double);
-
   // Derivative
   HLK_TEST(DerivativeDdx, HLSLHalf_t);
   HLK_TEST(DerivativeDdy, HLSLHalf_t);
@@ -2645,13 +2579,8 @@ public:
   HLK_TEST(QuadReadAcrossX, float);
   HLK_TEST(QuadReadAcrossY, float);
   HLK_TEST(QuadReadAcrossDiagonal, float);
-  HLK_TEST_DOUBLE(QuadReadLaneAt, double);
-  HLK_TEST_DOUBLE(QuadReadAcrossX, double);
-  HLK_TEST_DOUBLE(QuadReadAcrossY, double);
-  HLK_TEST_DOUBLE(QuadReadAcrossDiagonal, double);
 
   // Wave
-
   HLK_WAVEOP_TEST(WaveActiveAllEqual, HLSLBool_t);
   HLK_WAVEOP_TEST(WaveReadLaneAt, HLSLBool_t);
   HLK_WAVEOP_TEST(WaveReadLaneFirst, HLSLBool_t);
@@ -2781,6 +2710,451 @@ public:
   HLK_WAVEOP_TEST(WaveMultiPrefixSum, float);
   HLK_WAVEOP_TEST(WaveMultiPrefixProduct, float);
   HLK_WAVEOP_TEST(WaveMatch, float);
+
+  // ---- HLSLMin16Float_t (mirrors applicable HLSLHalf_t ops) ----
+
+  // TernaryMath
+  HLK_TEST(Mad, HLSLMin16Float_t);
+
+  // BinaryMath
+  HLK_TEST(Add, HLSLMin16Float_t);
+  HLK_TEST(Subtract, HLSLMin16Float_t);
+  HLK_TEST(Multiply, HLSLMin16Float_t);
+  HLK_TEST(Divide, HLSLMin16Float_t);
+  HLK_TEST(Modulus, HLSLMin16Float_t);
+  HLK_TEST(Min, HLSLMin16Float_t);
+  HLK_TEST(Max, HLSLMin16Float_t);
+  HLK_TEST(Ldexp, HLSLMin16Float_t);
+
+  // Saturate
+  HLK_TEST(Saturate, HLSLMin16Float_t);
+
+  // Unary
+  HLK_TEST(Initialize, HLSLMin16Float_t);
+  HLK_TEST(ArrayOperator_StaticAccess, HLSLMin16Float_t);
+  HLK_TEST(ArrayOperator_DynamicAccess, HLSLMin16Float_t);
+  HLK_TEST(ShuffleVector, HLSLMin16Float_t);
+
+  // Cast
+  HLK_TEST(CastToBool, HLSLMin16Float_t);
+  HLK_TEST(CastToInt32, HLSLMin16Float_t);
+  HLK_TEST(CastToInt64, HLSLMin16Float_t);
+  HLK_TEST(CastToUint32_FromFP, HLSLMin16Float_t);
+  HLK_TEST(CastToUint64_FromFP, HLSLMin16Float_t);
+  HLK_TEST(CastToFloat32, HLSLMin16Float_t);
+  // Note: CastToInt16, CastToUint16_FromFP, CastToFloat16 excluded —
+  // 16-bit output types require -enable-16bit-types which changes min
+  // precision semantics (min16float becomes half), breaking the test
+  // infrastructure's 32-bit buffer I/O assumptions.
+
+  // Trigonometric
+  HLK_TEST(Acos, HLSLMin16Float_t);
+  HLK_TEST(Asin, HLSLMin16Float_t);
+  HLK_TEST(Atan, HLSLMin16Float_t);
+  HLK_TEST(Cos, HLSLMin16Float_t);
+  HLK_TEST(Cosh, HLSLMin16Float_t);
+  HLK_TEST(Sin, HLSLMin16Float_t);
+  HLK_TEST(Sinh, HLSLMin16Float_t);
+  HLK_TEST(Tan, HLSLMin16Float_t);
+  HLK_TEST(Tanh, HLSLMin16Float_t);
+
+  // UnaryMath
+  HLK_TEST(Abs, HLSLMin16Float_t);
+  HLK_TEST(Ceil, HLSLMin16Float_t);
+  HLK_TEST(Exp, HLSLMin16Float_t);
+  HLK_TEST(Floor, HLSLMin16Float_t);
+  HLK_TEST(Frac, HLSLMin16Float_t);
+  HLK_TEST(Log, HLSLMin16Float_t);
+  HLK_TEST(Rcp, HLSLMin16Float_t);
+  HLK_TEST(Round, HLSLMin16Float_t);
+  HLK_TEST(Rsqrt, HLSLMin16Float_t);
+  HLK_TEST(Sign, HLSLMin16Float_t);
+  HLK_TEST(Sqrt, HLSLMin16Float_t);
+  HLK_TEST(Trunc, HLSLMin16Float_t);
+  HLK_TEST(Exp2, HLSLMin16Float_t);
+  HLK_TEST(Log10, HLSLMin16Float_t);
+  HLK_TEST(Log2, HLSLMin16Float_t);
+
+  // BinaryComparison
+  HLK_TEST(LessThan, HLSLMin16Float_t);
+  HLK_TEST(LessEqual, HLSLMin16Float_t);
+  HLK_TEST(GreaterThan, HLSLMin16Float_t);
+  HLK_TEST(GreaterEqual, HLSLMin16Float_t);
+  HLK_TEST(Equal, HLSLMin16Float_t);
+  HLK_TEST(NotEqual, HLSLMin16Float_t);
+
+  // Select
+  HLK_TEST(Select, HLSLMin16Float_t);
+
+  // Dot
+  HLK_TEST(Dot, HLSLMin16Float_t);
+
+  // LoadAndStore
+  HLK_TEST(LoadAndStore_RDH_BAB_SRV, HLSLMin16Float_t);
+  HLK_TEST(LoadAndStore_RDH_BAB_UAV, HLSLMin16Float_t);
+  HLK_TEST(LoadAndStore_DT_BAB_SRV, HLSLMin16Float_t);
+  HLK_TEST(LoadAndStore_DT_BAB_UAV, HLSLMin16Float_t);
+  HLK_TEST(LoadAndStore_RD_BAB_SRV, HLSLMin16Float_t);
+  HLK_TEST(LoadAndStore_RD_BAB_UAV, HLSLMin16Float_t);
+  HLK_TEST(LoadAndStore_RDH_SB_SRV, HLSLMin16Float_t);
+  HLK_TEST(LoadAndStore_RDH_SB_UAV, HLSLMin16Float_t);
+  HLK_TEST(LoadAndStore_DT_SB_SRV, HLSLMin16Float_t);
+  HLK_TEST(LoadAndStore_DT_SB_UAV, HLSLMin16Float_t);
+  HLK_TEST(LoadAndStore_RD_SB_SRV, HLSLMin16Float_t);
+  HLK_TEST(LoadAndStore_RD_SB_UAV, HLSLMin16Float_t);
+
+  // Derivative
+  HLK_TEST(DerivativeDdx, HLSLMin16Float_t);
+  HLK_TEST(DerivativeDdy, HLSLMin16Float_t);
+  HLK_TEST(DerivativeDdxFine, HLSLMin16Float_t);
+  HLK_TEST(DerivativeDdyFine, HLSLMin16Float_t);
+
+  // Quad
+  HLK_TEST(QuadReadLaneAt, HLSLMin16Float_t);
+  HLK_TEST(QuadReadAcrossX, HLSLMin16Float_t);
+  HLK_TEST(QuadReadAcrossY, HLSLMin16Float_t);
+  HLK_TEST(QuadReadAcrossDiagonal, HLSLMin16Float_t);
+
+  // Wave
+  HLK_WAVEOP_TEST(WaveActiveSum, HLSLMin16Float_t);
+  HLK_WAVEOP_TEST(WaveActiveMin, HLSLMin16Float_t);
+  HLK_WAVEOP_TEST(WaveActiveMax, HLSLMin16Float_t);
+  HLK_WAVEOP_TEST(WaveActiveProduct, HLSLMin16Float_t);
+  HLK_WAVEOP_TEST(WaveActiveAllEqual, HLSLMin16Float_t);
+  HLK_WAVEOP_TEST(WaveReadLaneAt, HLSLMin16Float_t);
+  HLK_WAVEOP_TEST(WaveReadLaneFirst, HLSLMin16Float_t);
+  HLK_WAVEOP_TEST(WavePrefixSum, HLSLMin16Float_t);
+  HLK_WAVEOP_TEST(WavePrefixProduct, HLSLMin16Float_t);
+  HLK_WAVEOP_TEST(WaveMultiPrefixSum, HLSLMin16Float_t);
+  HLK_WAVEOP_TEST(WaveMultiPrefixProduct, HLSLMin16Float_t);
+  HLK_WAVEOP_TEST(WaveMatch, HLSLMin16Float_t);
+
+  // ---- HLSLMin16Int_t (mirrors applicable int16_t ops) ----
+
+  // TernaryMath
+  HLK_TEST(Mad, HLSLMin16Int_t);
+
+  // BinaryMath
+  // Note: Divide and Modulus excluded — HLSL does not support signed integer
+  // division on minimum-precision types.
+  HLK_TEST(Add, HLSLMin16Int_t);
+  HLK_TEST(Subtract, HLSLMin16Int_t);
+  HLK_TEST(Multiply, HLSLMin16Int_t);
+  HLK_TEST(Min, HLSLMin16Int_t);
+  HLK_TEST(Max, HLSLMin16Int_t);
+
+  // Bitwise
+  HLK_TEST(And, HLSLMin16Int_t);
+  HLK_TEST(Or, HLSLMin16Int_t);
+  HLK_TEST(Xor, HLSLMin16Int_t);
+  HLK_TEST(LeftShift, HLSLMin16Int_t);
+  HLK_TEST(RightShift, HLSLMin16Int_t);
+  // Note: ReverseBits, CountBits, FirstBitHigh, FirstBitLow excluded -
+  // DXC promotes min precision to i32 before these intrinsics, so they
+  // don't operate at min precision.
+
+  // UnaryMath
+  HLK_TEST(Abs, HLSLMin16Int_t);
+  HLK_TEST(Sign, HLSLMin16Int_t);
+
+  // Unary
+  HLK_TEST(Initialize, HLSLMin16Int_t);
+  HLK_TEST(ArrayOperator_StaticAccess, HLSLMin16Int_t);
+  HLK_TEST(ArrayOperator_DynamicAccess, HLSLMin16Int_t);
+  HLK_TEST(ShuffleVector, HLSLMin16Int_t);
+
+  // Cast
+  HLK_TEST(CastToBool, HLSLMin16Int_t);
+  HLK_TEST(CastToInt32, HLSLMin16Int_t);
+  HLK_TEST(CastToInt64, HLSLMin16Int_t);
+  HLK_TEST(CastToUint32, HLSLMin16Int_t);
+  HLK_TEST(CastToUint64, HLSLMin16Int_t);
+  HLK_TEST(CastToFloat32, HLSLMin16Int_t);
+  // Note: CastToUint16, CastToFloat16 excluded — see min16float note.
+
+  // BinaryComparison
+  HLK_TEST(LessThan, HLSLMin16Int_t);
+  HLK_TEST(LessEqual, HLSLMin16Int_t);
+  HLK_TEST(GreaterThan, HLSLMin16Int_t);
+  HLK_TEST(GreaterEqual, HLSLMin16Int_t);
+  HLK_TEST(Equal, HLSLMin16Int_t);
+  HLK_TEST(NotEqual, HLSLMin16Int_t);
+
+  // Select
+  HLK_TEST(Select, HLSLMin16Int_t);
+
+  // Reduction
+  HLK_TEST(Any_Mixed, HLSLMin16Int_t);
+  HLK_TEST(Any_Zero, HLSLMin16Int_t);
+  HLK_TEST(Any_NoZero, HLSLMin16Int_t);
+  HLK_TEST(All_Mixed, HLSLMin16Int_t);
+  HLK_TEST(All_Zero, HLSLMin16Int_t);
+  HLK_TEST(All_NoZero, HLSLMin16Int_t);
+
+  // LoadAndStore
+  HLK_TEST(LoadAndStore_RDH_BAB_SRV, HLSLMin16Int_t);
+  HLK_TEST(LoadAndStore_RDH_BAB_UAV, HLSLMin16Int_t);
+  HLK_TEST(LoadAndStore_DT_BAB_SRV, HLSLMin16Int_t);
+  HLK_TEST(LoadAndStore_DT_BAB_UAV, HLSLMin16Int_t);
+  HLK_TEST(LoadAndStore_RD_BAB_SRV, HLSLMin16Int_t);
+  HLK_TEST(LoadAndStore_RD_BAB_UAV, HLSLMin16Int_t);
+  HLK_TEST(LoadAndStore_RDH_SB_SRV, HLSLMin16Int_t);
+  HLK_TEST(LoadAndStore_RDH_SB_UAV, HLSLMin16Int_t);
+  HLK_TEST(LoadAndStore_DT_SB_SRV, HLSLMin16Int_t);
+  HLK_TEST(LoadAndStore_DT_SB_UAV, HLSLMin16Int_t);
+  HLK_TEST(LoadAndStore_RD_SB_SRV, HLSLMin16Int_t);
+  HLK_TEST(LoadAndStore_RD_SB_UAV, HLSLMin16Int_t);
+
+  // Quad
+  HLK_TEST(QuadReadLaneAt, HLSLMin16Int_t);
+  HLK_TEST(QuadReadAcrossX, HLSLMin16Int_t);
+  HLK_TEST(QuadReadAcrossY, HLSLMin16Int_t);
+  HLK_TEST(QuadReadAcrossDiagonal, HLSLMin16Int_t);
+
+  // Wave
+  HLK_WAVEOP_TEST(WaveActiveSum, HLSLMin16Int_t);
+  HLK_WAVEOP_TEST(WaveActiveMin, HLSLMin16Int_t);
+  HLK_WAVEOP_TEST(WaveActiveMax, HLSLMin16Int_t);
+  HLK_WAVEOP_TEST(WaveActiveProduct, HLSLMin16Int_t);
+  HLK_WAVEOP_TEST(WaveActiveAllEqual, HLSLMin16Int_t);
+  HLK_WAVEOP_TEST(WaveReadLaneAt, HLSLMin16Int_t);
+  HLK_WAVEOP_TEST(WaveReadLaneFirst, HLSLMin16Int_t);
+  HLK_WAVEOP_TEST(WavePrefixSum, HLSLMin16Int_t);
+  HLK_WAVEOP_TEST(WavePrefixProduct, HLSLMin16Int_t);
+  HLK_WAVEOP_TEST(WaveMultiPrefixSum, HLSLMin16Int_t);
+  HLK_WAVEOP_TEST(WaveMultiPrefixProduct, HLSLMin16Int_t);
+  HLK_WAVEOP_TEST(WaveMultiPrefixBitAnd, HLSLMin16Int_t);
+  HLK_WAVEOP_TEST(WaveMultiPrefixBitOr, HLSLMin16Int_t);
+  HLK_WAVEOP_TEST(WaveMultiPrefixBitXor, HLSLMin16Int_t);
+  HLK_WAVEOP_TEST(WaveMatch, HLSLMin16Int_t);
+
+  // ---- HLSLMin16Uint_t (mirrors applicable uint16_t ops) ----
+
+  // TernaryMath
+  HLK_TEST(Mad, HLSLMin16Uint_t);
+
+  // BinaryMath
+  HLK_TEST(Add, HLSLMin16Uint_t);
+  HLK_TEST(Subtract, HLSLMin16Uint_t);
+  HLK_TEST(Multiply, HLSLMin16Uint_t);
+  HLK_TEST(Divide, HLSLMin16Uint_t);
+  HLK_TEST(Modulus, HLSLMin16Uint_t);
+  HLK_TEST(Min, HLSLMin16Uint_t);
+  HLK_TEST(Max, HLSLMin16Uint_t);
+
+  // Bitwise
+  HLK_TEST(And, HLSLMin16Uint_t);
+  HLK_TEST(Or, HLSLMin16Uint_t);
+  HLK_TEST(Xor, HLSLMin16Uint_t);
+  HLK_TEST(LeftShift, HLSLMin16Uint_t);
+  HLK_TEST(RightShift, HLSLMin16Uint_t);
+  // Note: ReverseBits, CountBits, FirstBitHigh, FirstBitLow excluded -
+  // DXC promotes min precision to i32 before these intrinsics, so they
+  // don't operate at min precision.
+
+  // UnaryMath
+  HLK_TEST(Abs, HLSLMin16Uint_t);
+  HLK_TEST(Sign, HLSLMin16Uint_t);
+
+  // Unary
+  HLK_TEST(Initialize, HLSLMin16Uint_t);
+  HLK_TEST(ArrayOperator_StaticAccess, HLSLMin16Uint_t);
+  HLK_TEST(ArrayOperator_DynamicAccess, HLSLMin16Uint_t);
+  HLK_TEST(ShuffleVector, HLSLMin16Uint_t);
+
+  // Cast
+  HLK_TEST(CastToBool, HLSLMin16Uint_t);
+  HLK_TEST(CastToInt32, HLSLMin16Uint_t);
+  HLK_TEST(CastToInt64, HLSLMin16Uint_t);
+  HLK_TEST(CastToUint32, HLSLMin16Uint_t);
+  HLK_TEST(CastToUint64, HLSLMin16Uint_t);
+  HLK_TEST(CastToFloat32, HLSLMin16Uint_t);
+  // Note: CastToInt16, CastToFloat16 excluded — see min16float note.
+
+  // BinaryComparison
+  HLK_TEST(LessThan, HLSLMin16Uint_t);
+  HLK_TEST(LessEqual, HLSLMin16Uint_t);
+  HLK_TEST(GreaterThan, HLSLMin16Uint_t);
+  HLK_TEST(GreaterEqual, HLSLMin16Uint_t);
+  HLK_TEST(Equal, HLSLMin16Uint_t);
+  HLK_TEST(NotEqual, HLSLMin16Uint_t);
+
+  // Select
+  HLK_TEST(Select, HLSLMin16Uint_t);
+
+  // LoadAndStore
+  HLK_TEST(LoadAndStore_RDH_BAB_SRV, HLSLMin16Uint_t);
+  HLK_TEST(LoadAndStore_RDH_BAB_UAV, HLSLMin16Uint_t);
+  HLK_TEST(LoadAndStore_DT_BAB_SRV, HLSLMin16Uint_t);
+  HLK_TEST(LoadAndStore_DT_BAB_UAV, HLSLMin16Uint_t);
+  HLK_TEST(LoadAndStore_RD_BAB_SRV, HLSLMin16Uint_t);
+  HLK_TEST(LoadAndStore_RD_BAB_UAV, HLSLMin16Uint_t);
+  HLK_TEST(LoadAndStore_RDH_SB_SRV, HLSLMin16Uint_t);
+  HLK_TEST(LoadAndStore_RDH_SB_UAV, HLSLMin16Uint_t);
+  HLK_TEST(LoadAndStore_DT_SB_SRV, HLSLMin16Uint_t);
+  HLK_TEST(LoadAndStore_DT_SB_UAV, HLSLMin16Uint_t);
+  HLK_TEST(LoadAndStore_RD_SB_SRV, HLSLMin16Uint_t);
+  HLK_TEST(LoadAndStore_RD_SB_UAV, HLSLMin16Uint_t);
+
+  // Quad
+  HLK_TEST(QuadReadLaneAt, HLSLMin16Uint_t);
+  HLK_TEST(QuadReadAcrossX, HLSLMin16Uint_t);
+  HLK_TEST(QuadReadAcrossY, HLSLMin16Uint_t);
+  HLK_TEST(QuadReadAcrossDiagonal, HLSLMin16Uint_t);
+
+  // Wave
+  HLK_WAVEOP_TEST(WaveActiveSum, HLSLMin16Uint_t);
+  HLK_WAVEOP_TEST(WaveActiveMin, HLSLMin16Uint_t);
+  HLK_WAVEOP_TEST(WaveActiveMax, HLSLMin16Uint_t);
+  HLK_WAVEOP_TEST(WaveActiveProduct, HLSLMin16Uint_t);
+  HLK_WAVEOP_TEST(WaveActiveAllEqual, HLSLMin16Uint_t);
+  HLK_WAVEOP_TEST(WaveReadLaneAt, HLSLMin16Uint_t);
+  HLK_WAVEOP_TEST(WaveReadLaneFirst, HLSLMin16Uint_t);
+  HLK_WAVEOP_TEST(WavePrefixSum, HLSLMin16Uint_t);
+  HLK_WAVEOP_TEST(WavePrefixProduct, HLSLMin16Uint_t);
+  HLK_WAVEOP_TEST(WaveMultiPrefixSum, HLSLMin16Uint_t);
+  HLK_WAVEOP_TEST(WaveMultiPrefixProduct, HLSLMin16Uint_t);
+  HLK_WAVEOP_TEST(WaveMultiPrefixBitAnd, HLSLMin16Uint_t);
+  HLK_WAVEOP_TEST(WaveMultiPrefixBitOr, HLSLMin16Uint_t);
+  HLK_WAVEOP_TEST(WaveMultiPrefixBitXor, HLSLMin16Uint_t);
+  HLK_WAVEOP_TEST(WaveMatch, HLSLMin16Uint_t);
+};
+
+#define HLK_TEST_DOUBLE(Op, DataType)                                          \
+  TEST_METHOD(Op##_##DataType) {                                               \
+    BEGIN_TEST_METHOD_PROPERTIES()                                             \
+    TEST_METHOD_PROPERTY("Kits.Specification",                                 \
+                         "Device.Graphics.D3D12.DXILCore.ShaderModel69."       \
+                         "DoublePrecision.Optional")                           \
+    END_TEST_METHOD_PROPERTIES()                                               \
+    runTest<DataType, OpType::Op>();                                           \
+  }
+
+#define HLK_WAVEOP_TEST_DOUBLE(Op, DataType)                                   \
+  TEST_METHOD(Op##_##DataType) {                                               \
+    BEGIN_TEST_METHOD_PROPERTIES()                                             \
+    TEST_METHOD_PROPERTY("Kits.Specification",                                 \
+                         "Device.Graphics.D3D12.DXILCore.ShaderModel69."       \
+                         "DoublePrecision.Optional")                           \
+    END_TEST_METHOD_PROPERTIES()                                               \
+    runWaveOpTest<DataType, OpType::Op>();                                     \
+  }
+
+class DxilConf_SM69_Vectorized_Double : public TestClassCommon {
+public:
+  BEGIN_TEST_CLASS(DxilConf_SM69_Vectorized_Double)
+  TEST_CLASS_PROPERTY(
+      "Kits.TestName",
+      "D3D12 - Shader Model 6.9 - Vectorized DXIL - Double Precision Tests")
+  TEST_CLASS_PROPERTY("Kits.TestId", "3a7a9687-6d99-469d-9951-795c2fcbe94d")
+  TEST_CLASS_PROPERTY(
+      "Kits.Description",
+      "Validates required double precision SM 6.9 vectorized DXIL operations")
+  TEST_METHOD_PROPERTY(
+      "Kits.Specification",
+      "Device.Graphics.D3D12.DXILCore.ShaderModel69.DoublePrecision.Optional")
+  TEST_METHOD_PROPERTY(L"Priority", L"0")
+  END_TEST_CLASS()
+
+  TEST_CLASS_SETUP(setupClass) {
+    const bool result = TestClassCommon::setupClass();
+#ifndef _HLK_CONF
+    if (result && !doesDeviceSupportDouble(D3DDevice)) {
+      WEX::Logging::Log::Comment(
+          L"Skipping test as device does not support double precision.");
+      WEX::Logging::Log::Result(WEX::Logging::TestResults::Skipped);
+      return false;
+    }
+#endif
+    return result;
+  }
+
+  TEST_METHOD_SETUP(setupMethod) { return TestClassCommon::setupMethod(); }
+
+  // TernaryMath
+  HLK_TEST_DOUBLE(Fma, double);
+  HLK_TEST_DOUBLE(Mad, double);
+
+  // BinaryMath
+  HLK_TEST_DOUBLE(Add, double);
+  HLK_TEST_DOUBLE(Subtract, double);
+  HLK_TEST_DOUBLE(Multiply, double);
+  HLK_TEST_DOUBLE(Divide, double);
+  HLK_TEST_DOUBLE(Min, double);
+  HLK_TEST_DOUBLE(Max, double);
+
+  // Bitwise
+  HLK_TEST_DOUBLE(Saturate, double);
+
+  // Unary
+  HLK_TEST_DOUBLE(Initialize, double);
+  HLK_TEST_DOUBLE(ArrayOperator_StaticAccess, double);
+  HLK_TEST_DOUBLE(ArrayOperator_DynamicAccess, double);
+
+  HLK_TEST_DOUBLE(ShuffleVector, double);
+
+  // Explicit Cast
+  HLK_TEST_DOUBLE(CastToBool, double);
+  HLK_TEST_DOUBLE(CastToInt16, double);
+  HLK_TEST_DOUBLE(CastToInt32, double);
+  HLK_TEST_DOUBLE(CastToInt64, double);
+  HLK_TEST_DOUBLE(CastToUint16_FromFP, double);
+  HLK_TEST_DOUBLE(CastToUint32_FromFP, double);
+  HLK_TEST_DOUBLE(CastToUint64_FromFP, double);
+  HLK_TEST_DOUBLE(CastToFloat16, double);
+  HLK_TEST_DOUBLE(CastToFloat32, double);
+
+  // Explicit Cast to Double (from various types)
+  HLK_TEST_DOUBLE(CastToFloat64, HLSLBool_t);
+  HLK_TEST_DOUBLE(CastToFloat64, HLSLHalf_t);
+  HLK_TEST_DOUBLE(CastToFloat64, float);
+  HLK_TEST_DOUBLE(CastToFloat64, uint16_t);
+  HLK_TEST_DOUBLE(CastToFloat64, uint32_t);
+  HLK_TEST_DOUBLE(CastToFloat64, uint64_t);
+  HLK_TEST_DOUBLE(CastToFloat64, int16_t);
+  HLK_TEST_DOUBLE(CastToFloat64, int32_t);
+  HLK_TEST_DOUBLE(CastToFloat64, int64_t);
+
+  // AsType (double precision)
+  HLK_TEST_DOUBLE(AsDouble, uint32_t);
+  HLK_TEST_DOUBLE(AsUint_SplitDouble, double);
+
+  // Unary Math
+  HLK_TEST_DOUBLE(Abs, double);
+  HLK_TEST_DOUBLE(Sign, double);
+
+  // Binary Comparison
+  HLK_TEST_DOUBLE(LessThan, double);
+  HLK_TEST_DOUBLE(LessEqual, double);
+  HLK_TEST_DOUBLE(GreaterThan, double);
+  HLK_TEST_DOUBLE(GreaterEqual, double);
+  HLK_TEST_DOUBLE(Equal, double);
+  HLK_TEST_DOUBLE(NotEqual, double);
+
+  // Ternary Logical
+  HLK_TEST_DOUBLE(Select, double);
+
+  // LoadAndStore
+  HLK_TEST_DOUBLE(LoadAndStore_RDH_BAB_SRV, double);
+  HLK_TEST_DOUBLE(LoadAndStore_RDH_BAB_UAV, double);
+  HLK_TEST_DOUBLE(LoadAndStore_DT_BAB_SRV, double);
+  HLK_TEST_DOUBLE(LoadAndStore_DT_BAB_UAV, double);
+  HLK_TEST_DOUBLE(LoadAndStore_RD_BAB_SRV, double);
+  HLK_TEST_DOUBLE(LoadAndStore_RD_BAB_UAV, double);
+  HLK_TEST_DOUBLE(LoadAndStore_RDH_SB_SRV, double);
+  HLK_TEST_DOUBLE(LoadAndStore_RDH_SB_UAV, double);
+  HLK_TEST_DOUBLE(LoadAndStore_DT_SB_SRV, double);
+  HLK_TEST_DOUBLE(LoadAndStore_DT_SB_UAV, double);
+  HLK_TEST_DOUBLE(LoadAndStore_RD_SB_SRV, double);
+  HLK_TEST_DOUBLE(LoadAndStore_RD_SB_UAV, double);
+
+  // Quad
+  HLK_TEST_DOUBLE(QuadReadLaneAt, double);
+  HLK_TEST_DOUBLE(QuadReadAcrossX, double);
+  HLK_TEST_DOUBLE(QuadReadAcrossY, double);
+  HLK_TEST_DOUBLE(QuadReadAcrossDiagonal, double);
+
+  // Wave
   HLK_WAVEOP_TEST_DOUBLE(WaveActiveSum, double);
   HLK_WAVEOP_TEST_DOUBLE(WaveActiveMin, double);
   HLK_WAVEOP_TEST_DOUBLE(WaveActiveMax, double);
@@ -2793,12 +3167,4 @@ public:
   HLK_WAVEOP_TEST_DOUBLE(WaveMultiPrefixSum, double);
   HLK_WAVEOP_TEST_DOUBLE(WaveMultiPrefixProduct, double);
   HLK_WAVEOP_TEST_DOUBLE(WaveMatch, double);
-
-private:
-  bool Initialized = false;
-  std::optional<D3D12SDKSelector> D3D12SDK;
-  bool VerboseLogging = false;
-  size_t OverrideInputSize = 0;
-  UINT OverrideWaveLaneCount = 0;
-  CComPtr<ID3D12Device> D3DDevice;
 };

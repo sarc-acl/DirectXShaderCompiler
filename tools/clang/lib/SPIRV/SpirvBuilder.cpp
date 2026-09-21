@@ -305,6 +305,7 @@ SpirvStore *SpirvBuilder::createStore(SpirvInstruction *address,
   }
 
   SpirvInstruction *source = value;
+  SpirvLoad *bitfieldLoad = nullptr;
   const auto &bitfieldInfo = address->getBitfieldInfo();
   if (bitfieldInfo.hasValue()) {
     // Generate SPIR-V type for value. This is required to know the final
@@ -313,11 +314,12 @@ SpirvStore *SpirvBuilder::createStore(SpirvInstruction *address,
     lowerTypeVisitor.visitInstruction(value);
     context.addToInstructionsWithLoweredType(value);
 
-    auto *base = createLoad(value->getResultType(), address, loc, range);
-    source = createBitFieldInsert(/*QualType*/ {}, base, value,
+    bitfieldLoad = createLoad(value->getResultType(), address, loc, range);
+    source = createBitFieldInsert(/*QualType*/ {}, bitfieldLoad, value,
                                   bitfieldInfo->offsetInBits,
                                   bitfieldInfo->sizeInBits, loc, range);
     source->setResultType(value->getResultType());
+    source->setAstResultType(value->getAstResultType());
   }
 
   auto *instruction =
@@ -337,6 +339,8 @@ SpirvStore *SpirvBuilder::createStore(SpirvInstruction *address,
     std::tie(align, size) = alignmentCalc.getAlignmentAndSize(
         source->getAstResultType(), address->getLayoutRule(), llvm::None,
         &stride);
+    if (bitfieldLoad)
+      bitfieldLoad->setAlignment(align);
     instruction->setAlignment(align);
   }
 
@@ -531,6 +535,19 @@ SpirvImageTexelPointer *SpirvBuilder::createImageTexelPointer(
   return instruction;
 }
 
+SpirvUntypedImageTexelPointerEXT *
+SpirvBuilder::createUntypedImageTexelPointerEXT(QualType resultType,
+                                                SpirvInstruction *image,
+                                                SpirvInstruction *coordinate,
+                                                SpirvInstruction *sample,
+                                                SourceLocation loc) {
+  assert(insertPoint && "null insert point");
+  auto *instruction = new (context) SpirvUntypedImageTexelPointerEXT(
+      resultType, loc, image, coordinate, sample);
+  insertPoint->addInstruction(instruction);
+  return instruction;
+}
+
 SpirvConvertPtrToU *SpirvBuilder::createConvertPtrToU(SpirvInstruction *ptr,
                                                       QualType type) {
   auto *instruction = new (context) SpirvConvertPtrToU(ptr, type);
@@ -620,8 +637,15 @@ SpirvInstruction *SpirvBuilder::createImageSample(
   assert(lod == nullptr || minLod == nullptr);
 
   // An OpSampledImage is required to do the image sampling.
-  auto *sampledImage =
-      createSampledImage(imageType, image, sampler, loc, range);
+  // Skip creating OpSampledImage if the imageType is a sampled texture.
+  SpirvInstruction *sampledImage;
+  if (isSampledTexture(imageType)) {
+    assert(!sampler &&
+           "sampler must be null when sampling from a sampled texture");
+    sampledImage = image;
+  } else {
+    sampledImage = createSampledImage(imageType, image, sampler, loc, range);
+  }
 
   const auto mask = composeImageOperandsMask(
       bias, lod, grad, constOffset, varOffset, constOffsets, sample, minLod);
@@ -707,8 +731,15 @@ SpirvInstruction *SpirvBuilder::createImageGather(
   assert(insertPoint && "null insert point");
 
   // An OpSampledImage is required to do the image sampling.
-  auto *sampledImage =
-      createSampledImage(imageType, image, sampler, loc, range);
+  // Skip creating OpSampledImage if the imageType is a sampled texture.
+  SpirvInstruction *sampledImage = nullptr;
+  if (isSampledTexture(imageType)) {
+    assert(!sampler &&
+           "sampler must be null when sampling from a sampled texture");
+    sampledImage = image;
+  } else {
+    sampledImage = createSampledImage(imageType, image, sampler, loc, range);
+  }
 
   // TODO: Update ImageGather to accept minLod if necessary.
   const auto mask = composeImageOperandsMask(
@@ -890,6 +921,16 @@ SpirvInstruction *SpirvBuilder::createNonSemanticDebugPrintfExtInst(
   auto *extInst = new (context)
       SpirvExtInst(resultType, loc, getExtInstSet("NonSemantic.DebugPrintf"),
                    instId, operands);
+  insertPoint->addInstruction(extInst);
+  return extInst;
+}
+
+SpirvInstruction *
+SpirvBuilder::createNonSemanticDebugBreakExtInst(SourceLocation loc) {
+  assert(insertPoint && "null insert point");
+  auto *extInst = new (context) SpirvExtInst(
+      astContext.VoidTy, loc, getExtInstSet("NonSemantic.DebugBreak"),
+      NonSemanticDebugBreakDebugBreak, {});
   insertPoint->addInstruction(extInst);
   return extInst;
 }
@@ -1346,7 +1387,7 @@ SpirvInstruction *SpirvBuilder::createSpirvIntrInstExt(
   SpirvExtInstImport *set =
       (instSet.size() == 0) ? nullptr : getExtInstSet(instSet);
 
-  if (retType != QualType() && retType->isVoidType()) {
+  if (!set && retType != QualType() && retType->isVoidType()) {
     retType = QualType();
   }
 
@@ -1691,6 +1732,29 @@ SpirvVariable *SpirvBuilder::addModuleVar(
   return var;
 }
 
+SpirvUntypedVariableKHR *SpirvBuilder::createUntypedVariableKHR(
+    const SpirvType *type, spv::StorageClass storageClass, llvm::StringRef name,
+    SourceLocation loc) {
+  assert(storageClass != spv::StorageClass::Function);
+  auto *var = new (context) SpirvUntypedVariableKHR(type, loc, storageClass);
+  mod->addVariable(var);
+  var->setDebugName(name);
+  return var;
+}
+
+SpirvUntypedAccessChainKHR *SpirvBuilder::createUntypedAccessChainKHR(
+    const SpirvType *resultType, const SpirvType *baseType,
+    SpirvInstruction *base, llvm::ArrayRef<SpirvInstruction *> indexes,
+    SourceLocation loc) {
+  assert(insertPoint && "null insert point");
+  auto *instruction = new (context)
+      SpirvUntypedAccessChainKHR(resultType, loc, baseType, base, indexes);
+  instruction->setStorageClass(base->getStorageClass());
+  instruction->setLayoutRule(base->getLayoutRule());
+  insertPoint->addInstruction(instruction);
+  return instruction;
+}
+
 void SpirvBuilder::decorateLocation(SpirvInstruction *target,
                                     uint32_t location) {
   auto *decor =
@@ -1885,6 +1949,16 @@ void SpirvBuilder::decorateWithLiterals(SpirvInstruction *targetInst,
                                         SourceLocation srcLoc) {
   SpirvDecoration *decor = new (context) SpirvDecoration(
       srcLoc, targetInst, static_cast<spv::Decoration>(decorate), literals);
+  assert(decor != nullptr);
+  mod->addDecoration(decor);
+}
+
+void SpirvBuilder::decorateWithLiterals(SpirvFunction *targetFunc,
+                                        unsigned decorate,
+                                        llvm::ArrayRef<unsigned> literals,
+                                        SourceLocation srcLoc) {
+  SpirvDecoration *decor = new (context) SpirvDecoration(
+      srcLoc, targetFunc, static_cast<spv::Decoration>(decorate), literals);
   assert(decor != nullptr);
   mod->addDecoration(decor);
 }

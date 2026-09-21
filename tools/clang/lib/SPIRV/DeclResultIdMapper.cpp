@@ -299,6 +299,14 @@ LocationAndComponent getLocationAndComponentCount(const ASTContext &astContext,
   return {0, 0, false};
 }
 
+/// Returns true if the given decl is a static variable declared inside
+/// a cbuffer/tbuffer/struct. These are not actually part of the
+/// cbuffer/tbuffer/struct, and should not consume a member index.
+bool isStaticBufferDecl(const Decl *decl) {
+  const auto *varDecl = dyn_cast<VarDecl>(decl);
+  return varDecl && varDecl->getStorageClass() == StorageClass::SC_Static;
+}
+
 bool shouldSkipInStructLayout(const Decl *decl) {
   // Ignore implicit generated struct declarations/constructors/destructors
   if (decl->isImplicit())
@@ -1056,7 +1064,8 @@ SpirvInstruction *DeclResultIdMapper::getDeclEvalInfo(const ValueDecl *decl,
 
 SpirvFunctionParameter *
 DeclResultIdMapper::createFnParam(const ParmVarDecl *param,
-                                  uint32_t dbgArgNumber) {
+                                  uint32_t dbgArgNumber,
+                                  bool decorateIntrinsicAttrs) {
   const auto type = getTypeOrFnRetType(param);
   const auto loc = param->getLocation();
   const auto range = param->getSourceRange();
@@ -1068,8 +1077,13 @@ DeclResultIdMapper::createFnParam(const ParmVarDecl *param,
   (void)getTypeAndCreateCounterForPotentialAliasVar(param, &isAlias);
   fnParamInstr->setContainsAliasComponent(isAlias);
 
-  if (isConstantTextureBuffer(type))
+  if (isConstantBuffer(type))
     fnParamInstr->setLayoutRule(spirvOptions.cBufferLayoutRule);
+  if (isTextureBuffer(type))
+    fnParamInstr->setLayoutRule(spirvOptions.tBufferLayoutRule);
+
+  if (decorateIntrinsicAttrs && param->hasAttrs())
+    decorateWithIntrinsicAttrs(param, fnParamInstr);
 
   assert(astDecls[param].instr == nullptr);
   registerVariableForDecl(param, fnParamInstr);
@@ -1117,6 +1131,11 @@ DeclResultIdMapper::createFnVar(const VarDecl *var,
   SpirvVariable *varInstr =
       spvBuilder.addFnVar(type, loc, name, isPrecise, isNointerp,
                           init.hasValue() ? init.getValue() : nullptr);
+
+  if (isConstantBuffer(type))
+    varInstr->setLayoutRule(spirvOptions.cBufferLayoutRule);
+  if (isTextureBuffer(type))
+    varInstr->setLayoutRule(spirvOptions.tBufferLayoutRule);
 
   bool isAlias = false;
   (void)getTypeAndCreateCounterForPotentialAliasVar(var, &isAlias);
@@ -1173,11 +1192,56 @@ DeclResultIdMapper::createFileVar(const VarDecl *var,
   return varInstr;
 }
 
-SpirvVariable *DeclResultIdMapper::createResourceHeap(const VarDecl *var,
-                                                      QualType ResourceType) {
+SpirvVariableLike *
+DeclResultIdMapper::createResourceDescriptorHeap(const VarDecl *var) {
+  SpirvUntypedVariableKHR *HeapVar = nullptr;
+
+  if (isResourceDescriptorHeap(var)) {
+    if (!ResourceHeapVar) {
+      const auto loc = var->getLocation();
+      const auto *type = spvContext.getUntypedPointerKHRType(
+          spv::StorageClass::UniformConstant);
+      ResourceHeapVar = spvBuilder.createUntypedVariableKHR(
+          type, spv::StorageClass::UniformConstant, "resource_heap", loc);
+      spvBuilder.decorateWithLiterals(
+          ResourceHeapVar, static_cast<uint32_t>(spv::Decoration::BuiltIn),
+          {static_cast<uint32_t>(spv::BuiltIn::ResourceHeapEXT)}, loc);
+    }
+    HeapVar = ResourceHeapVar;
+  } else if (isSamplerDescriptorHeap(var)) {
+    if (!SamplerHeapVar) {
+      const auto loc = var->getLocation();
+      const auto *type = spvContext.getUntypedPointerKHRType(
+          spv::StorageClass::UniformConstant);
+      SamplerHeapVar = spvBuilder.createUntypedVariableKHR(
+          type, spv::StorageClass::UniformConstant, "sampler_heap", loc);
+      spvBuilder.decorateWithLiterals(
+          SamplerHeapVar, static_cast<uint32_t>(spv::Decoration::BuiltIn),
+          {static_cast<uint32_t>(spv::BuiltIn::SamplerHeapEXT)}, loc);
+    }
+    HeapVar = SamplerHeapVar;
+  } else
+    llvm_unreachable("Unsupported heap type. FIXME");
+
+  // Decorate with BuiltIn
+  astDecls[var] = createDeclSpirvInfo(HeapVar);
+  return HeapVar;
+}
+
+SpirvVariableLike *
+DeclResultIdMapper::createEmulatedDescriptorHeap(const VarDecl *var,
+                                                 QualType resourceType) {
   QualType ResourceArrayType = astContext.getIncompleteArrayType(
-      ResourceType, clang::ArrayType::Normal, 0);
+      resourceType, clang::ArrayType::Normal, 0);
   return createExternVar(var, ResourceArrayType);
+}
+
+SpirvVariableLike *
+DeclResultIdMapper::createResourceHeap(const VarDecl *var,
+                                       QualType resourceType) {
+  if (spirvOptions.useDescriptorHeap)
+    return createResourceDescriptorHeap(var);
+  return createEmulatedDescriptorHeap(var, resourceType);
 }
 
 SpirvVariable *DeclResultIdMapper::createExternVar(const VarDecl *var) {
@@ -1263,6 +1327,21 @@ SpirvVariable *DeclResultIdMapper::createExternVar(const VarDecl *var,
     // another variable or function parameter
     needsLegalization = true;
   }
+
+  // If we have a multi-dimensional array of resources, we need to run
+  // legalization to flatten the array.
+  if (const auto *arrayType = astContext.getAsConstantArrayType(type)) {
+    if (astContext.getAsConstantArrayType(arrayType->getElementType())) {
+      QualType elemType = arrayType->getElementType();
+      while (const auto *innerArrayType =
+                 astContext.getAsConstantArrayType(elemType)) {
+        elemType = innerArrayType->getElementType();
+      }
+      if (hlsl::IsHLSLResourceType(elemType))
+        needsLegalization = true;
+    }
+  }
+
   if (vkImgFeatures.isCombinedImageSampler || vkImgFeatures.format) {
     spvContext.registerVkImageFeaturesForSpvVariable(varInstr, vkImgFeatures);
   }
@@ -1384,7 +1463,7 @@ SpirvVariable *DeclResultIdMapper::createStructOrStructArrayVarOfExplicitLayout(
 
       // Static variables are not part of the struct from a layout perspective.
       // Thus, they should not be listed in the struct fields.
-      if (fieldVar->getStorageClass() == StorageClass::SC_Static) {
+      if (isStaticBufferDecl(fieldVar)) {
         continue;
       }
 
@@ -1487,8 +1566,11 @@ void DeclResultIdMapper::createCTBuffer(const HLSLBufferDecl *decl) {
     if (shouldSkipInStructLayout(subDecl))
       continue;
 
-    // If the subDecl is a resource, it is lowered as a standalone variable.
     const auto *varDecl = cast<VarDecl>(subDecl);
+
+    if (isStaticBufferDecl(varDecl))
+      continue;
+
     if (isResourceType(varDecl->getType())) {
       createExternVar(varDecl);
       continue;
@@ -1666,6 +1748,9 @@ DeclResultIdMapper::createShaderRecordBuffer(const HLSLBufferDecl *decl,
     if (isResourceType(varDecl->getType()))
       continue;
 
+    if (isStaticBufferDecl(varDecl))
+      continue;
+
     registerVariableForDecl(varDecl, createDeclSpirvInfo(bufferVar, index++));
   }
   return bufferVar;
@@ -1755,6 +1840,17 @@ SpirvFunction *DeclResultIdMapper::getOrRegisterFn(const FunctionDecl *fn) {
                                spv::LinkageType::Export, fn->getLocation());
   }
 
+  // Honor inline-SPIR-V attributes placed directly on a function. The
+  // entry-point path handles these only for entry functions, and the
+  // vk::ext_instruction path only for functions lowered to an instruction, so a
+  // plain function was previously skipped and these attributes silently
+  // dropped. These reuse the same helpers as the variable/parameter paths:
+  //   [[vk::ext_decorate(d, ...)]]  -> OpDecorate targeting the OpFunction
+  //   [[vk::ext_capability(c)]]     -> OpCapability for the module
+  //   [[vk::ext_extension("...")]]  -> OpExtension for the module
+  decorateWithIntrinsicAttrs(fn, spirvFunction);
+  registerCapabilitiesAndExtensionsForDecl(fn);
+
   // No need to dereference to get the pointer. Function returns that are
   // stand-alone aliases are already pointers to values. All other cases should
   // be normal rvalues.
@@ -1767,7 +1863,7 @@ SpirvFunction *DeclResultIdMapper::getOrRegisterFn(const FunctionDecl *fn) {
   return spirvFunction;
 }
 
-const CounterIdAliasPair *DeclResultIdMapper::getCounterIdAliasPair(
+const CounterIdAliasPair *DeclResultIdMapper::getOrCreateCounterIdAliasPair(
     const DeclaratorDecl *decl, const llvm::SmallVector<uint32_t, 4> *indices) {
   if (!decl)
     return nullptr;
@@ -1793,24 +1889,6 @@ const CounterIdAliasPair *DeclResultIdMapper::getCounterIdAliasPair(
       return &counter->second;
   }
 
-  return nullptr;
-}
-
-const CounterIdAliasPair *
-DeclResultIdMapper::createOrGetCounterIdAliasPair(const DeclaratorDecl *decl) {
-  auto counterPair = getCounterIdAliasPair(decl);
-  if (counterPair)
-    return counterPair;
-  if (!decl)
-    return nullptr;
-  // If deferred RWStructuredBuffer, try creating the counter now
-  auto declInstr = declRWSBuffers[decl];
-  if (declInstr) {
-    createCounterVar(decl, declInstr, /*isAlias*/ false);
-    auto counter = counterVars.find(decl);
-    assert(counter != counterVars.end() && "counter not found");
-    return &counter->second;
-  }
   return nullptr;
 }
 
@@ -1939,9 +2017,9 @@ void DeclResultIdMapper::createFieldCounterVars(
   }
 }
 
-std::vector<SpirvVariable *>
+std::vector<SpirvVariableLike *>
 DeclResultIdMapper::collectStageVars(SpirvFunction *entryPoint) const {
-  std::vector<SpirvVariable *> vars;
+  std::vector<SpirvVariableLike *> vars;
 
   for (auto var : glPerVertex.getStageInVars())
     vars.push_back(var);
@@ -3880,12 +3958,17 @@ bool DeclResultIdMapper::createPayloadStageVars(
     // DispatchMesh. In this case, change the storage class from Workgroup to
     // TaskPayloadWorkgroupEXT.
     if (featureManager.isExtensionEnabled(Extension::EXT_mesh_shader)) {
-      for (SpirvVariable *moduleVar : spvBuilder.getModule()->getVariables()) {
-        if (moduleVar->getAstResultType() == type) {
-          moduleVar->setStorageClass(
-              spv::StorageClass::TaskPayloadWorkgroupEXT);
-          varInstr = moduleVar;
-        }
+      for (SpirvInstruction *moduleInst :
+           spvBuilder.getModule()->getVariables()) {
+        auto *moduleVar = dyn_cast<SpirvVariable>(moduleInst);
+        if (!moduleVar)
+          continue;
+
+        if (moduleVar->getAstResultType() != type)
+          continue;
+
+        moduleVar->setStorageClass(spv::StorageClass::TaskPayloadWorkgroupEXT);
+        varInstr = moduleVar;
       }
     }
 
@@ -4956,18 +5039,17 @@ bool DeclResultIdMapper::tryToCreateConstantVar(const ValueDecl *decl) {
 }
 
 void DeclResultIdMapper::decorateWithIntrinsicAttrs(
-    const NamedDecl *decl, SpirvVariable *varInst,
+    const NamedDecl *decl, SpirvInstruction *targetInst,
     llvm::function_ref<void(VKDecorateExtAttr *)> extraFunctionForDecoAttr) {
   if (!decl->hasAttrs())
     return;
 
-  // TODO: Handle member field in a struct and function parameter.
   for (auto &attr : decl->getAttrs()) {
     if (auto decoAttr = dyn_cast<VKDecorateExtAttr>(attr)) {
       spvBuilder.decorateWithLiterals(
-          varInst, decoAttr->getDecorate(),
+          targetInst, decoAttr->getDecorate(),
           {decoAttr->literals_begin(), decoAttr->literals_end()},
-          varInst->getSourceLocation());
+          targetInst->getSourceLocation());
       extraFunctionForDecoAttr(decoAttr);
       continue;
     }
@@ -4976,15 +5058,43 @@ void DeclResultIdMapper::decorateWithIntrinsicAttrs(
       for (Expr *arg : decoAttr->arguments()) {
         args.push_back(theEmitter.doExpr(arg));
       }
-      spvBuilder.decorateWithIds(varInst, decoAttr->getDecorate(), args,
-                                 varInst->getSourceLocation());
+      spvBuilder.decorateWithIds(targetInst, decoAttr->getDecorate(), args,
+                                 targetInst->getSourceLocation());
       continue;
     }
     if (auto decoAttr = dyn_cast<VKDecorateStringExtAttr>(attr)) {
       llvm::SmallVector<llvm::StringRef, 2> args(decoAttr->arguments_begin(),
                                                  decoAttr->arguments_end());
-      spvBuilder.decorateWithStrings(varInst, decoAttr->getDecorate(), args,
-                                     varInst->getSourceLocation());
+      spvBuilder.decorateWithStrings(targetInst, decoAttr->getDecorate(), args,
+                                     targetInst->getSourceLocation());
+      continue;
+    }
+  }
+}
+
+void DeclResultIdMapper::decorateWithIntrinsicAttrs(const NamedDecl *decl,
+                                                    SpirvFunction *targetFunc) {
+  if (!decl->hasAttrs())
+    return;
+
+  for (auto &attr : decl->getAttrs()) {
+    if (auto *decoAttr = dyn_cast<VKDecorateExtAttr>(attr)) {
+      spvBuilder.decorateWithLiterals(
+          targetFunc, decoAttr->getDecorate(),
+          {decoAttr->literals_begin(), decoAttr->literals_end()},
+          decl->getLocation());
+      continue;
+    }
+    // The id/string forms decorate a SpirvInstruction target; there is no
+    // SpirvFunction-target equivalent yet, so reject rather than silently drop.
+    if (isa<VKDecorateIdExtAttr>(attr)) {
+      emitError("vk::ext_decorate_id is not supported on functions",
+                decl->getLocation());
+      continue;
+    }
+    if (isa<VKDecorateStringExtAttr>(attr)) {
+      emitError("vk::ext_decorate_string is not supported on functions",
+                decl->getLocation());
       continue;
     }
   }
@@ -5076,6 +5186,17 @@ void DeclResultIdMapper::storeOutStageVarsToStorage(
     storeOutStageVarsToStorage(cast<DeclaratorDecl>(field), ctrlPointID,
                                field->getType(), tempLocation);
     ++index;
+  }
+}
+
+void DeclResultIdMapper::registerCapabilitiesAndExtensionsForDecl(
+    const NamedDecl *decl) {
+  for (auto *attribute : decl->specific_attrs<VKExtensionExtAttr>()) {
+    spvBuilder.requireExtension(attribute->getName(), decl->getLocation());
+  }
+  for (auto *attribute : decl->specific_attrs<VKCapabilityExtAttr>()) {
+    spv::Capability cap = spv::Capability(attribute->getCapability());
+    spvBuilder.requireCapability(cap, decl->getLocation());
   }
 }
 
